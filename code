@@ -80,9 +80,6 @@
 
 
 // Nivel digital correspondente a borda branca.
-//
-// Se durante o teste estiver invertido,
-// trocar 0 por 1.
 #define NIVEL_BORDA 0
 
 
