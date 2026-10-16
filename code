@@ -1,5 +1,5 @@
 // ======================================================
-// ROBOSTRONDA - ROBO SUMO AUTONOMO
+// Wall-e Force - ROBO SUMO AUTONOMO
 //
 // 3 sensores TCRT5000
 // 2 sensores HC-SR04
@@ -906,7 +906,7 @@ void setup()
     );
 
     printf(
-        "       ROBOSTRONDA - SUMO\n"
+        "       WALL-E FORCE - SUMO\n"
     );
 
     printf(
