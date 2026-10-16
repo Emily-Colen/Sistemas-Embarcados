@@ -1,0 +1,1363 @@
+// ======================================================
+// ROBOSTRONDA - ROBO SUMO AUTONOMO
+//
+// 3 sensores TCRT5000
+// 2 sensores HC-SR04
+// 2 motores DC
+// Ponte H TB6612FNG
+// ESP32
+//
+// Estrutura:
+// setup()
+// loop()
+// app_main()
+// ======================================================
+
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+
+
+// ======================================================
+// PINOS HC-SR04
+// ======================================================
+
+// Sensor frontal
+#define TRIG_FRENTE 32
+#define ECHO_FRENTE 34
+
+// Sensor traseiro
+#define TRIG_TRAS 33
+#define ECHO_TRAS 35
+
+
+// ======================================================
+// PINOS TCRT5000
+// ======================================================
+
+// Sensor frontal esquerdo
+#define TCRT_ESQUERDO 36
+
+// Sensor frontal direito
+#define TCRT_DIREITO 39
+
+// Sensor traseiro
+#define TCRT_TRASEIRO 18
+
+
+// ======================================================
+// PINOS TB6612FNG
+// ======================================================
+
+// Motor esquerdo
+#define AIN1 25
+#define AIN2 26
+#define PWMA 27
+
+// Motor direito
+#define BIN1 23
+#define BIN2 22
+#define PWMB 21
+
+
+// ======================================================
+// CONFIGURACOES DO ROBO
+// ======================================================
+
+// Distancia maxima para considerar que existe
+// um adversario
+#define DISTANCIA_INIMIGO 60
+
+
+// Nivel digital correspondente a borda branca.
+//
+// Se durante o teste estiver invertido,
+// trocar 0 por 1.
+#define NIVEL_BORDA 0
+
+
+// ======================================================
+// VELOCIDADES
+// ======================================================
+//
+// PWM varia de:
+//
+// 0   = parado
+// 255 = velocidade maxima
+//
+
+#define VELOCIDADE_ATAQUE 255
+
+#define VELOCIDADE_BUSCA 150
+
+#define VELOCIDADE_GIRO 180
+
+#define VELOCIDADE_RECUO 220
+
+
+// ======================================================
+// TEMPOS DE MOVIMENTO
+// ======================================================
+
+// Tempo de recuo quando encontra a borda frontal
+#define TEMPO_RECUO 300
+
+// Tempo de giro para voltar para dentro da arena
+#define TEMPO_GIRO_BORDA 300
+
+// Tempo utilizado para aproximadamente 180 graus
+//
+// ESTE VALOR PRECISA SER CALIBRADO NO ROBO REAL.
+#define TEMPO_GIRO_180 450
+
+
+// ======================================================
+// PROTOTIPOS DAS FUNCOES
+// ======================================================
+
+
+// ---------------- HC-SR04 ----------------
+
+void setup_hc_sr04(int trig_pin, int echo_pin);
+
+int ler_HC_SR04(int trig_pin, int echo_pin);
+
+
+// ---------------- TCRT5000 ----------------
+
+void setup_tcrt5000(int sensor_pin);
+
+int ler_TCRT5000(int sensor_pin);
+
+
+// ---------------- MOTORES ----------------
+
+void setup_motor();
+
+void motor_esquerdo(int velocidade);
+
+void motor_direito(int velocidade);
+
+
+// ---------------- MOVIMENTOS ----------------
+
+void frente(int velocidade);
+
+void tras(int velocidade);
+
+void girar_esquerda(int velocidade);
+
+void girar_direita(int velocidade);
+
+void parar();
+
+
+// ---------------- ESTRATEGIAS ----------------
+
+void escapar_borda(
+    int borda_esquerda,
+    int borda_direita,
+    int borda_traseira
+);
+
+
+// ---------------- PRINCIPAIS ----------------
+
+void setup();
+
+void loop();
+
+void app_main();
+
+
+// ======================================================
+// CONFIGURACAO DO HC-SR04
+// ======================================================
+
+void setup_hc_sr04(int trig_pin, int echo_pin)
+{
+    // TRIG envia o pulso para o sensor
+    gpio_set_direction(
+        trig_pin,
+        GPIO_MODE_OUTPUT
+    );
+
+
+    // ECHO recebe o pulso de retorno
+    gpio_set_direction(
+        echo_pin,
+        GPIO_MODE_INPUT
+    );
+
+
+    // Comeca com o TRIG desligado
+    gpio_set_level(
+        trig_pin,
+        0
+    );
+}
+
+
+// ======================================================
+// LEITURA DO HC-SR04
+// ======================================================
+
+int ler_HC_SR04(int trig_pin, int echo_pin)
+{
+    // --------------------------------------------------
+    // Garante TRIG em nivel baixo
+    // --------------------------------------------------
+
+    gpio_set_level(
+        trig_pin,
+        0
+    );
+
+    esp_rom_delay_us(2);
+
+
+    // --------------------------------------------------
+    // Envia pulso de 10 microssegundos
+    // --------------------------------------------------
+
+    gpio_set_level(
+        trig_pin,
+        1
+    );
+
+    esp_rom_delay_us(10);
+
+    gpio_set_level(
+        trig_pin,
+        0
+    );
+
+
+    // --------------------------------------------------
+    // Espera o ECHO ficar em nivel alto
+    // --------------------------------------------------
+
+    uint64_t inicio_timeout =
+        esp_timer_get_time();
+
+
+    while (
+        gpio_get_level(echo_pin) == 0
+    )
+    {
+        uint64_t tempo_atual =
+            esp_timer_get_time();
+
+
+        // Se passar de 30 ms sem resposta,
+        // considera leitura invalida.
+        if (
+            (tempo_atual - inicio_timeout)
+            > 30000
+        )
+        {
+            return -1;
+        }
+    }
+
+
+    // --------------------------------------------------
+    // Inicio do pulso ECHO
+    // --------------------------------------------------
+
+    uint64_t inicio_echo =
+        esp_timer_get_time();
+
+
+    // --------------------------------------------------
+    // Espera o ECHO voltar para zero
+    // --------------------------------------------------
+
+    while (
+        gpio_get_level(echo_pin) == 1
+    )
+    {
+        uint64_t tempo_atual =
+            esp_timer_get_time();
+
+
+        // Protecao para nao travar o programa
+        if (
+            (tempo_atual - inicio_echo)
+            > 30000
+        )
+        {
+            return -1;
+        }
+    }
+
+
+    // --------------------------------------------------
+    // Fim do pulso
+    // --------------------------------------------------
+
+    uint64_t fim_echo =
+        esp_timer_get_time();
+
+
+    // Tempo total do ECHO
+    uint64_t tempo_echo =
+        fim_echo - inicio_echo;
+
+
+    // --------------------------------------------------
+    // Calcula distancia
+    //
+    // Distancia aproximada:
+    //
+    // tempo / 58 = centimetros
+    // --------------------------------------------------
+
+    int distanciaCm =
+        tempo_echo / 58;
+
+
+    return distanciaCm;
+}
+
+
+// ======================================================
+// CONFIGURACAO TCRT5000
+// ======================================================
+
+void setup_tcrt5000(int sensor_pin)
+{
+    gpio_set_direction(
+        sensor_pin,
+        GPIO_MODE_INPUT
+    );
+}
+
+
+// ======================================================
+// LEITURA TCRT5000
+// ======================================================
+
+int ler_TCRT5000(int sensor_pin)
+{
+    return gpio_get_level(sensor_pin);
+}
+
+
+// ======================================================
+// CONFIGURACAO DOS MOTORES
+// ======================================================
+
+void setup_motor()
+{
+    // ==================================================
+    // PINOS DE DIRECAO DA PONTE H
+    // ==================================================
+
+    gpio_set_direction(
+        AIN1,
+        GPIO_MODE_OUTPUT
+    );
+
+    gpio_set_direction(
+        AIN2,
+        GPIO_MODE_OUTPUT
+    );
+
+
+    gpio_set_direction(
+        BIN1,
+        GPIO_MODE_OUTPUT
+    );
+
+    gpio_set_direction(
+        BIN2,
+        GPIO_MODE_OUTPUT
+    );
+
+
+    // ==================================================
+    // TIMER PWM
+    // ==================================================
+
+    ledc_timer_config_t timer = {
+
+        .speed_mode =
+            LEDC_LOW_SPEED_MODE,
+
+        .timer_num =
+            LEDC_TIMER_0,
+
+        .duty_resolution =
+            LEDC_TIMER_8_BIT,
+
+        .freq_hz =
+            20000,
+
+        .clk_cfg =
+            LEDC_AUTO_CLK
+    };
+
+
+    ledc_timer_config(
+        &timer
+    );
+
+
+    // ==================================================
+    // PWM MOTOR ESQUERDO
+    // ==================================================
+
+    ledc_channel_config_t canal_esquerdo = {
+
+        .gpio_num =
+            PWMA,
+
+        .speed_mode =
+            LEDC_LOW_SPEED_MODE,
+
+        .channel =
+            LEDC_CHANNEL_0,
+
+        .timer_sel =
+            LEDC_TIMER_0,
+
+        .duty =
+            0,
+
+        .hpoint =
+            0
+    };
+
+
+    ledc_channel_config(
+        &canal_esquerdo
+    );
+
+
+    // ==================================================
+    // PWM MOTOR DIREITO
+    // ==================================================
+
+    ledc_channel_config_t canal_direito = {
+
+        .gpio_num =
+            PWMB,
+
+        .speed_mode =
+            LEDC_LOW_SPEED_MODE,
+
+        .channel =
+            LEDC_CHANNEL_1,
+
+        .timer_sel =
+            LEDC_TIMER_0,
+
+        .duty =
+            0,
+
+        .hpoint =
+            0
+    };
+
+
+    ledc_channel_config(
+        &canal_direito
+    );
+}
+
+
+// ======================================================
+// MOTOR ESQUERDO
+// ======================================================
+
+void motor_esquerdo(int velocidade)
+{
+    // Limita velocidade maxima
+    if (velocidade > 255)
+    {
+        velocidade = 255;
+    }
+
+
+    // Limita velocidade minima
+    if (velocidade < -255)
+    {
+        velocidade = -255;
+    }
+
+
+    // ==================================================
+    // FRENTE
+    // ==================================================
+
+    if (velocidade > 0)
+    {
+        gpio_set_level(AIN1, 1);
+
+        gpio_set_level(AIN2, 0);
+    }
+
+
+    // ==================================================
+    // TRAS
+    // ==================================================
+
+    else if (velocidade < 0)
+    {
+        gpio_set_level(AIN1, 0);
+
+        gpio_set_level(AIN2, 1);
+    }
+
+
+    // ==================================================
+    // PARADO
+    // ==================================================
+
+    else
+    {
+        gpio_set_level(AIN1, 0);
+
+        gpio_set_level(AIN2, 0);
+    }
+
+
+    // PWM nao pode ser negativo
+    int pwm = velocidade;
+
+
+    if (pwm < 0)
+    {
+        pwm = -pwm;
+    }
+
+
+    // Define velocidade
+    ledc_set_duty(
+        LEDC_LOW_SPEED_MODE,
+        LEDC_CHANNEL_0,
+        pwm
+    );
+
+
+    ledc_update_duty(
+        LEDC_LOW_SPEED_MODE,
+        LEDC_CHANNEL_0
+    );
+}
+
+
+// ======================================================
+// MOTOR DIREITO
+// ======================================================
+
+void motor_direito(int velocidade)
+{
+    if (velocidade > 255)
+    {
+        velocidade = 255;
+    }
+
+
+    if (velocidade < -255)
+    {
+        velocidade = -255;
+    }
+
+
+    // ==================================================
+    // FRENTE
+    // ==================================================
+
+    if (velocidade > 0)
+    {
+        gpio_set_level(BIN1, 1);
+
+        gpio_set_level(BIN2, 0);
+    }
+
+
+    // ==================================================
+    // TRAS
+    // ==================================================
+
+    else if (velocidade < 0)
+    {
+        gpio_set_level(BIN1, 0);
+
+        gpio_set_level(BIN2, 1);
+    }
+
+
+    // ==================================================
+    // PARADO
+    // ==================================================
+
+    else
+    {
+        gpio_set_level(BIN1, 0);
+
+        gpio_set_level(BIN2, 0);
+    }
+
+
+    int pwm = velocidade;
+
+
+    if (pwm < 0)
+    {
+        pwm = -pwm;
+    }
+
+
+    ledc_set_duty(
+        LEDC_LOW_SPEED_MODE,
+        LEDC_CHANNEL_1,
+        pwm
+    );
+
+
+    ledc_update_duty(
+        LEDC_LOW_SPEED_MODE,
+        LEDC_CHANNEL_1
+    );
+}
+
+
+// ======================================================
+// MOVIMENTOS DO ROBO
+// ======================================================
+
+
+// ---------------- FRENTE ----------------
+
+void frente(int velocidade)
+{
+    motor_esquerdo(
+        velocidade
+    );
+
+    motor_direito(
+        velocidade
+    );
+}
+
+
+// ---------------- TRAS ----------------
+
+void tras(int velocidade)
+{
+    motor_esquerdo(
+        -velocidade
+    );
+
+    motor_direito(
+        -velocidade
+    );
+}
+
+
+// ---------------- GIRO PARA ESQUERDA ----------------
+
+void girar_esquerda(int velocidade)
+{
+    // Motor esquerdo para tras
+    motor_esquerdo(
+        -velocidade
+    );
+
+
+    // Motor direito para frente
+    motor_direito(
+        velocidade
+    );
+}
+
+
+// ---------------- GIRO PARA DIREITA ----------------
+
+void girar_direita(int velocidade)
+{
+    // Motor esquerdo para frente
+    motor_esquerdo(
+        velocidade
+    );
+
+
+    // Motor direito para tras
+    motor_direito(
+        -velocidade
+    );
+}
+
+
+// ---------------- PARAR ----------------
+
+void parar()
+{
+    motor_esquerdo(0);
+
+    motor_direito(0);
+}
+
+
+// ======================================================
+// ESTRATEGIA DE FUGA DA BORDA
+// ======================================================
+
+void escapar_borda(
+    int borda_esquerda,
+    int borda_direita,
+    int borda_traseira
+)
+{
+    // Primeiro para o robo
+    parar();
+
+
+    // Pequena pausa
+    vTaskDelay(
+        pdMS_TO_TICKS(20)
+    );
+
+
+    // ==================================================
+    // BORDA NOS DOIS SENSORES FRONTAIS
+    // ==================================================
+
+    if (
+        borda_esquerda &&
+        borda_direita
+    )
+    {
+        printf(
+            "BORDA: FRENTE COMPLETA\n"
+        );
+
+
+        printf(
+            "ACAO: RECUAR E GIRAR\n"
+        );
+
+
+        // Sai da linha branca
+        tras(
+            VELOCIDADE_RECUO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_RECUO
+            )
+        );
+
+
+        // Volta para dentro da arena
+        girar_direita(
+            VELOCIDADE_GIRO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_GIRO_BORDA
+            )
+        );
+    }
+
+
+    // ==================================================
+    // BORDA FRONTAL ESQUERDA
+    // ==================================================
+
+    else if (borda_esquerda)
+    {
+        printf(
+            "BORDA: ESQUERDA\n"
+        );
+
+
+        printf(
+            "ACAO: RE + DIREITA\n"
+        );
+
+
+        tras(
+            VELOCIDADE_RECUO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_RECUO
+            )
+        );
+
+
+        girar_direita(
+            VELOCIDADE_GIRO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_GIRO_BORDA
+            )
+        );
+    }
+
+
+    // ==================================================
+    // BORDA FRONTAL DIREITA
+    // ==================================================
+
+    else if (borda_direita)
+    {
+        printf(
+            "BORDA: DIREITA\n"
+        );
+
+
+        printf(
+            "ACAO: RE + ESQUERDA\n"
+        );
+
+
+        tras(
+            VELOCIDADE_RECUO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_RECUO
+            )
+        );
+
+
+        girar_esquerda(
+            VELOCIDADE_GIRO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(
+                TEMPO_GIRO_BORDA
+            )
+        );
+    }
+
+
+    // ==================================================
+    // BORDA TRASEIRA
+    // ==================================================
+
+    else if (borda_traseira)
+    {
+        printf(
+            "BORDA: TRASEIRA\n"
+        );
+
+
+        printf(
+            "ACAO: FRENTE\n"
+        );
+
+
+        // Se a traseira chegou na borda,
+        // anda para frente.
+        frente(
+            VELOCIDADE_RECUO
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(300)
+        );
+    }
+
+
+    parar();
+}
+
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup()
+{
+    printf("\n");
+
+    printf(
+        "=====================================\n"
+    );
+
+    printf(
+        "       ROBOSTRONDA - SUMO\n"
+    );
+
+    printf(
+        "=====================================\n"
+    );
+
+
+    // ==================================================
+    // CONFIGURA HC-SR04
+    // ==================================================
+
+    setup_hc_sr04(
+        TRIG_FRENTE,
+        ECHO_FRENTE
+    );
+
+
+    setup_hc_sr04(
+        TRIG_TRAS,
+        ECHO_TRAS
+    );
+
+
+    // ==================================================
+    // CONFIGURA TCRT5000
+    // ==================================================
+
+    setup_tcrt5000(
+        TCRT_ESQUERDO
+    );
+
+
+    setup_tcrt5000(
+        TCRT_DIREITO
+    );
+
+
+    setup_tcrt5000(
+        TCRT_TRASEIRO
+    );
+
+
+    // ==================================================
+    // CONFIGURA MOTORES
+    // ==================================================
+
+    setup_motor();
+
+
+    // Garante que inicia parado
+    parar();
+
+
+    printf(
+        "Sensores configurados.\n"
+    );
+
+    printf(
+        "Motores configurados.\n"
+    );
+
+
+    // ==================================================
+    // ESPERA OBRIGATORIA DE 5 SEGUNDOS
+    // ==================================================
+
+    printf("\n");
+
+    printf(
+        "Robo parado.\n"
+    );
+
+    printf(
+        "Inicio em 5 segundos...\n"
+    );
+
+
+    for (
+        int segundos = 5;
+        segundos > 0;
+        segundos--
+    )
+    {
+        printf(
+            "%d...\n",
+            segundos
+        );
+
+
+        vTaskDelay(
+            pdMS_TO_TICKS(1000)
+        );
+    }
+
+
+    printf("\n");
+
+    printf(
+        "INICIANDO!\n"
+    );
+
+    printf("\n");
+}
+
+
+// ======================================================
+// LOOP PRINCIPAL
+// ======================================================
+
+void loop()
+{
+    while (1)
+    {
+
+        // ==================================================
+        // 1 - LEITURA DOS TCRT5000
+        // ==================================================
+
+        int tcrt_esquerdo =
+            ler_TCRT5000(
+                TCRT_ESQUERDO
+            );
+
+
+        int tcrt_direito =
+            ler_TCRT5000(
+                TCRT_DIREITO
+            );
+
+
+        int tcrt_traseiro =
+            ler_TCRT5000(
+                TCRT_TRASEIRO
+            );
+
+
+        // ==================================================
+        // CONVERTE LEITURA EM BORDA OU ARENA
+        // ==================================================
+
+        int borda_esquerda =
+            (
+                tcrt_esquerdo
+                ==
+                NIVEL_BORDA
+            );
+
+
+        int borda_direita =
+            (
+                tcrt_direito
+                ==
+                NIVEL_BORDA
+            );
+
+
+        int borda_traseira =
+            (
+                tcrt_traseiro
+                ==
+                NIVEL_BORDA
+            );
+
+
+        // ==================================================
+        // MOSTRA TCRT NO TERMINAL
+        // ==================================================
+
+        printf(
+            "-----------------------------------\n"
+        );
+
+
+        printf(
+            "TCRT ESQ  : %d | %s\n",
+            tcrt_esquerdo,
+            borda_esquerda
+                ? "BORDA"
+                : "ARENA"
+        );
+
+
+        printf(
+            "TCRT DIR  : %d | %s\n",
+            tcrt_direito,
+            borda_direita
+                ? "BORDA"
+                : "ARENA"
+        );
+
+
+        printf(
+            "TCRT TRAS : %d | %s\n",
+            tcrt_traseiro,
+            borda_traseira
+                ? "BORDA"
+                : "ARENA"
+        );
+
+
+        // ==================================================
+        // PRIORIDADE 1
+        //
+        // BORDA SEMPRE TEM PRIORIDADE MAXIMA
+        // ==================================================
+
+        if (
+            borda_esquerda ||
+            borda_direita ||
+            borda_traseira
+        )
+        {
+            escapar_borda(
+                borda_esquerda,
+                borda_direita,
+                borda_traseira
+            );
+
+
+            // Volta diretamente para o inicio do loop.
+            // Nao tenta atacar enquanto esta fugindo
+            // da borda.
+            continue;
+        }
+
+
+        // ==================================================
+        // 2 - LEITURA DO HC-SR04 FRONTAL
+        // ==================================================
+
+        int distancia_frente =
+            ler_HC_SR04(
+                TRIG_FRENTE,
+                ECHO_FRENTE
+            );
+
+
+        // --------------------------------------------------
+        // Pequeno intervalo entre os ultrassonicos.
+        //
+        // Isso reduz a possibilidade de um sensor receber
+        // o eco produzido pelo outro.
+        // --------------------------------------------------
+
+        vTaskDelay(
+            pdMS_TO_TICKS(40)
+        );
+
+
+        // ==================================================
+        // 3 - LEITURA DO HC-SR04 TRASEIRO
+        // ==================================================
+
+        int distancia_tras =
+            ler_HC_SR04(
+                TRIG_TRAS,
+                ECHO_TRAS
+            );
+
+
+        // ==================================================
+        // MOSTRA DISTANCIAS
+        // ==================================================
+
+        if (distancia_frente == -1)
+        {
+            printf(
+                "HC FRENTE : SEM OBJETO\n"
+            );
+        }
+
+        else
+        {
+            printf(
+                "HC FRENTE : %d cm\n",
+                distancia_frente
+            );
+        }
+
+
+        if (distancia_tras == -1)
+        {
+            printf(
+                "HC TRAS   : SEM OBJETO\n"
+            );
+        }
+
+        else
+        {
+            printf(
+                "HC TRAS   : %d cm\n",
+                distancia_tras
+            );
+        }
+
+
+        // ==================================================
+        // VERIFICA ADVERSARIO
+        // ==================================================
+
+        int inimigo_frente = 0;
+
+        int inimigo_tras = 0;
+
+
+        // --------------------------------------------------
+        // Frente
+        // --------------------------------------------------
+
+        if (
+            distancia_frente > 0 &&
+            distancia_frente <= DISTANCIA_INIMIGO
+        )
+        {
+            inimigo_frente = 1;
+        }
+
+
+        // --------------------------------------------------
+        // Tras
+        // --------------------------------------------------
+
+        if (
+            distancia_tras > 0 &&
+            distancia_tras <= DISTANCIA_INIMIGO
+        )
+        {
+            inimigo_tras = 1;
+        }
+
+
+        // ==================================================
+        // PRIORIDADE 2
+        //
+        // ADVERSARIO NA FRENTE
+        // ==================================================
+
+        if (inimigo_frente)
+        {
+            printf(
+                "INIMIGO: FRENTE\n"
+            );
+
+
+            printf(
+                "ACAO: ATAQUE MAXIMO\n"
+            );
+
+
+            // Os dois motores avançam com PWM 255
+            frente(
+                VELOCIDADE_ATAQUE
+            );
+        }
+
+
+        // ==================================================
+        // PRIORIDADE 3
+        //
+        // ADVERSARIO ATRAS
+        // ==================================================
+
+        else if (inimigo_tras)
+        {
+            printf(
+                "INIMIGO: ATRAS\n"
+            );
+
+
+            printf(
+                "ACAO: GIRAR 180 GRAUS\n"
+            );
+
+
+            // Faz aproximadamente meia volta
+            girar_direita(
+                VELOCIDADE_GIRO
+            );
+
+
+            vTaskDelay(
+                pdMS_TO_TICKS(
+                    TEMPO_GIRO_180
+                )
+            );
+
+
+            parar();
+
+
+            // Depois da meia-volta, o loop
+            // vai medir novamente.
+        }
+
+
+        // ==================================================
+        // PRIORIDADE 4
+        //
+        // NENHUM ADVERSARIO
+        // ==================================================
+
+        else
+        {
+            printf(
+                "INIMIGO: NAO ENCONTRADO\n"
+            );
+
+
+            printf(
+                "ACAO: BUSCANDO\n"
+            );
+
+
+            // Robo gira no proprio eixo procurando
+            // um adversario.
+            girar_direita(
+                VELOCIDADE_BUSCA
+            );
+        }
+
+
+        printf(
+            "-----------------------------------\n\n"
+        );
+
+
+        // Pequena pausa para evitar uso excessivo
+        // do processador.
+        vTaskDelay(
+            pdMS_TO_TICKS(30)
+        );
+    }
+}
+
+
+// ======================================================
+// APP_MAIN
+// ======================================================
+//
+// Primeira funcao executada pelo ESP-IDF.
+//
+// Ela chama setup uma vez.
+//
+// Depois chama loop, que executa indefinidamente.
+//
+// Funciona de forma semelhante ao Arduino.
+// ======================================================
+
+void app_main()
+{
+    setup();
+
+    loop();
+}
